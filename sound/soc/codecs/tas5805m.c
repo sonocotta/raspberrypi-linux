@@ -76,6 +76,13 @@ static const uint8_t dsp_cfg_preboot[] = {
 	TAS5805M_REG_DEVICE_CTRL_2, TAS5805M_DCTRL2_MODE_HIZ,
 };
 
+#define SET_BOOK_AND_PAGE(rm, book, page) \
+    do { \
+        regmap_write(rm, TAS5805M_REG_PAGE_SET, TAS5805M_REG_PAGE_0); \
+        regmap_write(rm, TAS5805M_REG_BOOK_SET, book);                   \
+        regmap_write(rm, TAS5805M_REG_PAGE_SET, page);                   \
+    } while (0)
+
 struct tas5805m_priv {
 	struct i2c_client		*i2c;
 	struct regulator		*pvdd;
@@ -88,6 +95,10 @@ struct tas5805m_priv {
 
 	int						vol;
 	int						gain;
+	int						mixer_l2l;  /* Left to Left mixer gain in dB */
+	int						mixer_r2l;  /* Right to Left mixer gain in dB */
+	int						mixer_l2r;  /* Left to Right mixer gain in dB */
+	int						mixer_r2r;  /* Right to Right mixer gain in dB */
 	unsigned int			modulation_mode;
 	unsigned int			switch_freq;
 	unsigned int			bridge_mode;
@@ -148,6 +159,49 @@ static void tas5805m_decode_faults(struct device *dev, unsigned int chan,
 	}
 }
 
+/**
+ * Convert a dB value into a 4-byte buffer in "9.23" fixed-point format.
+ * @param db_value Integer dB value to convert.
+ * @param buffer 4-byte buffer to store the result.
+ */
+static void tas5805m_map_db_to_9_23(int db_value, uint8_t buffer[4]) {
+    // Reference value for 0 dB in 9.23 format
+    const uint32_t reference = 0x00800000; // 1.0 in 9.23 format
+    uint32_t value = reference; // Start with the 0 dB reference
+
+    if (db_value > 0) {
+        // Positive dB: Scale up the value
+        while (db_value >= 6) {
+            value <<= 1; // Multiply by 2
+            db_value -= 6;
+        }
+    } else if (db_value < 0) {
+        // Negative dB: Scale down the value
+        while (db_value <= -6) {
+            value >>= 1; // Divide by 2
+            db_value += 6;
+        }
+    }
+
+    // Handle fractional dB values (fine-tuning)
+    if (db_value != 0) {
+        // Approximation for fractional scaling (using linear interpolation)
+        // For simplicity: 6 dB corresponds to a factor of 2, so smaller steps
+        // scale proportionally using integer math.
+        if (db_value > 0) {
+            value += (value >> 1) * db_value / 6; // Scale up
+        } else {
+            value -= (value >> 1) * (-db_value) / 6; // Scale down
+        }
+    }
+
+    // Write the 32-bit value into the buffer
+    buffer[0] = (value >> 24) & 0xFF;
+    buffer[1] = (value >> 16) & 0xFF;
+    buffer[2] = (value >> 8) & 0xFF;
+    buffer[3] = value & 0xFF;
+}
+
 static void tas5805m_refresh(struct tas5805m_priv *tas5805m)
 {
 	unsigned int chan, global1, global2, ot_warning;
@@ -158,8 +212,7 @@ static void tas5805m_refresh(struct tas5805m_priv *tas5805m)
 	dev_dbg(&tas5805m->i2c->dev, "%s: is_muted=%d, vol=0x%02x (%ddB), gain=0x%02x (%ddB)\n", 
 		__func__, tas5805m->is_muted, tas5805m->vol, db_value, tas5805m->gain, db_gain);
 
-	regmap_write(rm, REG_PAGE, TAS5805M_REG_PAGE_0);
-	regmap_write(rm, REG_BOOK, TAS5805M_BOOK_CONTROL_PORT);
+	SET_BOOK_AND_PAGE(rm, TAS5805M_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_0);
 
 	/* Validate fault states */
 	regmap_read(rm, TAS5805M_REG_CHAN_FAULT, &chan);
@@ -215,6 +268,38 @@ static void tas5805m_refresh(struct tas5805m_priv *tas5805m)
 				__func__, tas5805m->eq_mode);
 	regmap_write(rm, TAS5805M_REG_DSP_MISC, tas5805m->eq_mode & 0x1);
 
+	/* Write mixer gain registers
+	 * Convert dB values to 9.23 fixed-point format and write to registers
+	 */
+	u8 mixer_buf[4];
+	SET_BOOK_AND_PAGE(rm, TAS5805M_BOOK_5, TAS5805M_BOOK_5_MIXER_PAGE);
+	
+	dev_dbg(&tas5805m->i2c->dev, "%s: mixer gains: L2L=%ddB, R2L=%ddB, L2R=%ddB, R2R=%ddB\n",
+				__func__, tas5805m->mixer_l2l, tas5805m->mixer_r2l,
+				tas5805m->mixer_l2r, tas5805m->mixer_r2r);
+
+	tas5805m_map_db_to_9_23(tas5805m->mixer_l2l, mixer_buf);
+	regmap_bulk_write(rm, TAS5805M_REG_LEFT_TO_LEFT_GAIN, mixer_buf, 4);
+	dev_dbg(&tas5805m->i2c->dev, "%s: wrote L2L mixer gain: 0x%02x <- 0x%02x %02x %02x %02x\n",
+				__func__, TAS5805M_REG_LEFT_TO_LEFT_GAIN, mixer_buf[0], mixer_buf[1], mixer_buf[2], mixer_buf[3]);
+	
+	tas5805m_map_db_to_9_23(tas5805m->mixer_r2l, mixer_buf);
+	regmap_bulk_write(rm, TAS5805M_REG_RIGHT_TO_LEFT_GAIN, mixer_buf, 4);
+	dev_dbg(&tas5805m->i2c->dev, "%s: wrote R2L mixer gain: 0x%02x <- 0x%02x %02x %02x %02x\n",
+				__func__, TAS5805M_REG_RIGHT_TO_LEFT_GAIN, mixer_buf[0], mixer_buf[1], mixer_buf[2], mixer_buf[3]);
+	
+	tas5805m_map_db_to_9_23(tas5805m->mixer_l2r, mixer_buf);
+	regmap_bulk_write(rm, TAS5805M_REG_LEFT_TO_RIGHT_GAIN, mixer_buf, 4);
+	dev_dbg(&tas5805m->i2c->dev, "%s: wrote L2R mixer gain: 0x%02x <- 0x%02x %02x %02x %02x\n",
+				__func__, TAS5805M_REG_LEFT_TO_RIGHT_GAIN, mixer_buf[0], mixer_buf[1], mixer_buf[2], mixer_buf[3]);
+	
+	tas5805m_map_db_to_9_23(tas5805m->mixer_r2r, mixer_buf);
+	regmap_bulk_write(rm, TAS5805M_REG_RIGHT_TO_RIGHT_GAIN, mixer_buf, 4);
+	dev_dbg(&tas5805m->i2c->dev, "%s: wrote R2R mixer gain: 0x%02x <- 0x%02x %02x %02x %02x\n",
+				__func__, TAS5805M_REG_RIGHT_TO_RIGHT_GAIN, mixer_buf[0], mixer_buf[1], mixer_buf[2], mixer_buf[3]);
+	
+	SET_BOOK_AND_PAGE(rm, TAS5805M_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_0);
+	
 	/* Set/clear digital soft-mute */
 	uint8_t device_state = (tas5805m->is_muted ? TAS5805M_DCTRL2_MUTE : 0) |
 			TAS5805M_DCTRL2_MODE_PLAY;
@@ -467,7 +552,72 @@ static struct tas5805m_enum_ctrl eq_mode_ctrl = {
 	.private_value = (unsigned long)&xenum_ctrl,\
 }
 
+/* Mixer control handlers */
+static int tas5805m_mixer_info(struct snd_kcontrol *kcontrol,
+						   struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = 1;
+	uinfo->value.integer.min = TAS5805M_MIXER_MIN_DB;
+	uinfo->value.integer.max = TAS5805M_MIXER_MAX_DB;
+	return 0;
+}
 
+static int tas5805m_mixer_get(struct snd_kcontrol *kcontrol,
+						  struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
+	struct tas5805m_priv *tas5805m = snd_soc_component_get_drvdata(component);
+	unsigned int offset = kcontrol->private_value;
+	int *mixer_ptr = (int *)((char *)tas5805m + offset);
+
+	mutex_lock(&tas5805m->lock);
+	ucontrol->value.integer.value[0] = *mixer_ptr;
+	mutex_unlock(&tas5805m->lock);
+
+	return 0;
+}
+
+static int tas5805m_mixer_put(struct snd_kcontrol *kcontrol,
+						  struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
+	struct tas5805m_priv *tas5805m = snd_soc_component_get_drvdata(component);
+	unsigned int offset = kcontrol->private_value;
+	int *mixer_ptr = (int *)((char *)tas5805m + offset);
+	int value = ucontrol->value.integer.value[0];
+	int ret = 0;
+
+	if (value < TAS5805M_MIXER_MIN_DB || value > TAS5805M_MIXER_MAX_DB)
+		return -EINVAL;
+
+	mutex_lock(&tas5805m->lock);
+	if (*mixer_ptr != value) {
+		*mixer_ptr = value;
+		dev_dbg(component->dev, "%s: set %s=%ddB (is_powered=%d)\n",
+				__func__, kcontrol->id.name, value, tas5805m->is_powered);
+		if (tas5805m->is_powered)
+			tas5805m_refresh(tas5805m);
+		else
+			dev_dbg(component->dev, "%s: mixer change deferred until power-up\n",
+					__func__);
+		ret = 1;
+	}
+	mutex_unlock(&tas5805m->lock);
+
+	return ret;
+}
+
+#define TAS5805M_MIXER(xname, xoffset) \
+{\
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,\
+	.name = xname,\
+	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,\
+	.info = tas5805m_mixer_info,\
+	.get = tas5805m_mixer_get,\
+	.put = tas5805m_mixer_put,\
+	.private_value = offsetof(struct tas5805m_priv, xoffset),\
+}
 
 static const struct snd_kcontrol_new tas5805m_snd_controls[] = {
 	{
@@ -489,6 +639,10 @@ static const struct snd_kcontrol_new tas5805m_snd_controls[] = {
 		.put	= tas5805m_again_put,
 		.tlv.p	= tas5805m_again_tlv,
 	},
+	TAS5805M_MIXER("Mixer L2L Gain", mixer_l2l),
+	TAS5805M_MIXER("Mixer R2L Gain", mixer_r2l),
+	TAS5805M_MIXER("Mixer L2R Gain", mixer_l2r),
+	TAS5805M_MIXER("Mixer R2R Gain", mixer_r2r),
 	TAS5805M_ENUM("Modulation Scheme", modulation_mode_ctrl),
 	TAS5805M_ENUM("Switching Freq", switch_freq_ctrl),
 	TAS5805M_ENUM("Bridge Mode", bridge_mode_ctrl),
@@ -561,9 +715,10 @@ static void do_work(struct work_struct *work)
 	if (!tas5805m->dsp_initialized) {
 		dev_dbg(&tas5805m->i2c->dev, "%s: sending preboot config\n", __func__);
 		send_cfg(rm, dsp_cfg_preboot, ARRAY_SIZE(dsp_cfg_preboot));
+		// Need to wait until clock is read by the DAC
+		usleep_range(5000, 15000);
 		if (tas5805m->dsp_cfg_len > 0)
 		{
-			usleep_range(5000, 15000);
 			send_cfg(rm, tas5805m->dsp_cfg_data, tas5805m->dsp_cfg_len);
 		}
 		tas5805m->dsp_initialized = true;
@@ -780,6 +935,10 @@ static int tas5805m_i2c_probe(struct i2c_client *i2c)
 	 */
 	tas5805m->vol = TAS5805M_VOLUME_ZERO_DB;
 	tas5805m->gain = TAS5805M_AGAIN_MAX; /* 0dB analog gain */
+	tas5805m->mixer_l2l = TAS5805M_MIXER_MAX_DB; /* 0dB L2L mixer gain */
+	tas5805m->mixer_r2l = TAS5805M_MIXER_MIN_DB; /* Muted R2L mixer */
+	tas5805m->mixer_l2r = TAS5805M_MIXER_MIN_DB; /* Muted L2R mixer */
+	tas5805m->mixer_r2r = TAS5805M_MIXER_MAX_DB; /* 0dB R2R mixer gain */
 	tas5805m->modulation_mode = 0; /* BD mode */
 	tas5805m->switch_freq = 0; /* 768kHz */
 	tas5805m->bridge_mode = 0; /* Normal mode */
