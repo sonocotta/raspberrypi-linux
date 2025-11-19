@@ -280,24 +280,17 @@ static void tas5805m_refresh(struct tas5805m_priv *tas5805m)
 
 	tas5805m_map_db_to_9_23(tas5805m->mixer_l2l, mixer_buf);
 	regmap_bulk_write(rm, TAS5805M_REG_LEFT_TO_LEFT_GAIN, mixer_buf, 4);
-	dev_dbg(&tas5805m->i2c->dev, "%s: wrote L2L mixer gain: 0x%02x <- 0x%02x %02x %02x %02x\n",
-				__func__, TAS5805M_REG_LEFT_TO_LEFT_GAIN, mixer_buf[0], mixer_buf[1], mixer_buf[2], mixer_buf[3]);
 	
 	tas5805m_map_db_to_9_23(tas5805m->mixer_r2l, mixer_buf);
 	regmap_bulk_write(rm, TAS5805M_REG_RIGHT_TO_LEFT_GAIN, mixer_buf, 4);
-	dev_dbg(&tas5805m->i2c->dev, "%s: wrote R2L mixer gain: 0x%02x <- 0x%02x %02x %02x %02x\n",
-				__func__, TAS5805M_REG_RIGHT_TO_LEFT_GAIN, mixer_buf[0], mixer_buf[1], mixer_buf[2], mixer_buf[3]);
 	
 	tas5805m_map_db_to_9_23(tas5805m->mixer_l2r, mixer_buf);
 	regmap_bulk_write(rm, TAS5805M_REG_LEFT_TO_RIGHT_GAIN, mixer_buf, 4);
-	dev_dbg(&tas5805m->i2c->dev, "%s: wrote L2R mixer gain: 0x%02x <- 0x%02x %02x %02x %02x\n",
-				__func__, TAS5805M_REG_LEFT_TO_RIGHT_GAIN, mixer_buf[0], mixer_buf[1], mixer_buf[2], mixer_buf[3]);
 	
 	tas5805m_map_db_to_9_23(tas5805m->mixer_r2r, mixer_buf);
 	regmap_bulk_write(rm, TAS5805M_REG_RIGHT_TO_RIGHT_GAIN, mixer_buf, 4);
-	dev_dbg(&tas5805m->i2c->dev, "%s: wrote R2R mixer gain: 0x%02x <- 0x%02x %02x %02x %02x\n",
-				__func__, TAS5805M_REG_RIGHT_TO_RIGHT_GAIN, mixer_buf[0], mixer_buf[1], mixer_buf[2], mixer_buf[3]);
 	
+	/* Return to control port page 0 */	
 	SET_BOOK_AND_PAGE(rm, TAS5805M_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_0);
 	
 	/* Set/clear digital soft-mute */
@@ -639,10 +632,13 @@ static const struct snd_kcontrol_new tas5805m_snd_controls[] = {
 		.put	= tas5805m_again_put,
 		.tlv.p	= tas5805m_again_tlv,
 	},
+
 	TAS5805M_MIXER("Mixer L2L Gain", mixer_l2l),
 	TAS5805M_MIXER("Mixer R2L Gain", mixer_r2l),
 	TAS5805M_MIXER("Mixer L2R Gain", mixer_l2r),
 	TAS5805M_MIXER("Mixer R2R Gain", mixer_r2r),
+
+	
 	TAS5805M_ENUM("Modulation Scheme", modulation_mode_ctrl),
 	TAS5805M_ENUM("Switching Freq", switch_freq_ctrl),
 	TAS5805M_ENUM("Bridge Mode", bridge_mode_ctrl),
